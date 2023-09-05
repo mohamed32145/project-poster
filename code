@@ -1,0 +1,95 @@
+# Load required libraries
+library(readxl)
+library(data.table)
+library(ggplot2)
+library(anytime)
+library(Rcpp)
+library(reconstructr)
+
+# Clear the workspace
+rm(list=ls())
+
+# Set the working directory and file name
+setwd("/Users/sarit/Google Drive/Haifa_SpecialEdu/Research/LV_Navigation/Supersense_data")
+fn <- "Android Explore and Find Events 01.06.2021 - 02.01.2021.xlsx"
+
+# Read data from Excel file
+sheetnames <- excel_sheets(fn)
+mylist <- lapply(excel_sheets(fn), read_excel, path = fn, col_types = "text")
+names(mylist) <- sheetnames
+mylist2 <- mapply(cbind, mylist, sheetnames)
+mylist2 <- lapply(mylist2, function(x) {names(x)[ncol(x)] <- "event_type";x})
+my_merge <- function(df1, df2){ merge(df1, df2, all=TRUE)}
+df_events <- Reduce(my_merge, mylist2)
+
+# Convert data to a data.table
+dt <- as.data.table(df_events)
+
+# Remove unnecessary columns
+dt[, c("mobile_brand_name","mobile_model_name","operating_system", 
+        "operating_system_version","sub_continent",
+        "source...18","sub_continent...17",
+        "source...16","sub_continent...15","category","language") := NULL]
+
+# Convert event timestamp to a datetime format
+dt[, event_time := anytime(as.numeric(event_timestamp)/1e6)]
+
+# Calculate the number of users by country and continent
+dt[, countries_N := .N, by=.(country, user_pseudo_id)]
+dt[, n_users_country := length(unique(user_pseudo_id)), by=.(country)]
+
+# Create a plot of the number of users by country and continent
+ggplot(dt[n_users_country > 30, ], aes(x = n_users_country, y = country, color = continent)) +
+  geom_point(size = 3) +
+  xlab("number of users") +
+  scale_x_log10()
+
+# Calculate user frequency and sessionize the data
+dt[, user_freq := .N, by = user_pseudo_id][order(user_freq, decreasing = TRUE)]
+setnames(dt, "session_id", "original_session_id")
+sessionised_data <- sessionise(x = dt, timestamp = event_time, user_id = user_pseudo_id, threshold = 1800)
+dt[user_freq < 7, .N, by = user_pseudo_id]
+dt[user_freq > 6, .N, by = user_pseudo_id]
+length(unique(dt$user_pseudo_id))
+
+# Analyze data by session
+by_session <- sessionised_data[!is.na(time_delta), .(time_delta, session_id, user_freq), by = user_pseudo_id]
+by_session <- unique(by_session[, .(dur_ses_sec = sum(time_delta), user_pseudo_id, user_freq), by = session_id])
+by_session <- by_session[dur_ses_sec > 0]
+by_session[, dur_ses_min := dur_ses_sec/60, by = session_id]
+plus_30_sess <- by_session[dur_ses_min >= 30]
+minus_30_sess <- by_session[dur_ses_min < 30]
+
+# Analyze average time per event for the two groups
+plus_30_id <- plus_30_sess$session_id
+minus_30_id <- minus_30_sess$session_id
+plus_30_general <- sessionised_data[session_id %in% plus_30_id]
+minus_30_general <- sessionised_data[session_id %in% minus_30_id]
+event_types <- c("read", "find", "explore")
+plus_30_general <- plus_30_general[event_type %in% event_types, .N, by = .(event_type, user_pseudo_id)]
+plus <- plus_30_general[, .(sum(.N)/167), by = event_type]
+minus_30_general <- minus_30_general[event_type %in% event_types, .N, by = .(event_type, user_pseudo_id)]
+minus <- minus_30_general[, sum(.N)/3252, by = event_type]
+print(plus, minus)
+
+# Analyze how many users use find/explore/read
+events_data <- sessionised_data[event_type %in% event_types, .N, by = .(user_pseudo_id, event_type)]
+events_data[, .N, by = event_type]
+
+# Analyze how long on average it takes for each type (explore/find/read)
+new_events <- c("read_end", "explore_end", "detection_success")
+sessionised_data[event_name %in% new_events & !is.na(time_delta), .(sum(time_delta)/.N), by = event_name]
+
+# Analyze each object and the time until finding it
+explore_ses <- sessionised_data[event_name == "explore"]$session_id
+explore_result <- sessionised_data[(session_id %in% explore_ses) & event_name == "detection_success",
+                                   .(.N, time = mean(time_delta)), by = .(object)][order(time, decreasing = TRUE)]
+ggplot(explore_result[time > 10], aes(time, object)) +
+  geom_point()
+
+find_ses <- sessionised_data[event_type == "find"]$session_id
+find_result <- sessionised_data[(session_id %in% find_ses) & event_name == "detection_success",
+                               .(.N, time = mean(time_delta)), by = .(object)][order(N, decreasing = TRUE)]
+find_result <- find_result[order(N, decreasing = FALSE)]
+find_result$object <- factor(find_result$object, levels = find_result$object)
+ggplot(find_result[N > 3], aes
